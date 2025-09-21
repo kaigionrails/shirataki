@@ -1,5 +1,5 @@
 require 'bundler/setup'
-require_relative 'lib/simple_sse_app'
+require_relative 'lib/redis_streams_sse_app'
 
-app = SimpleSSEApp.new
+app = RedisStreamsSSEApp.new
 run app

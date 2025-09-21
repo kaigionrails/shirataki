@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  valkey:
+    image: valkey/valkey:7.2-alpine
+    ports:
+      - "6379:6379"
+    command: valkey-server --appendonly yes
+    volumes:
+      - valkey-data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Optional: Redis Commander for GUI management
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    environment:
+      - REDIS_HOSTS=local:valkey:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - valkey
+
+volumes:
+  valkey-data:
+    driver: local

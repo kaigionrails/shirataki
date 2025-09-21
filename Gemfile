@@ -3,3 +3,5 @@
 source "https://rubygems.org"
 
 gem "falcon", "~> 0.51.1"
+gem "async"
+gem "rack"

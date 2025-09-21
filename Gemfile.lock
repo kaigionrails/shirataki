@@ -86,7 +86,9 @@ PLATFORMS
   x86_64-linux
 
 DEPENDENCIES
+  async
   falcon (~> 0.51.1)
+  rack
 
 BUNDLED WITH
    2.6.7

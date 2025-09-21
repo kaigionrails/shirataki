@@ -1,8 +1,5 @@
-class App
-  def call(env)
-    [200, { 'Content-Type' => 'text/plain' }, ['Hello, world!']]
-  end
-end
+require 'bundler/setup'
+require_relative 'lib/simple_sse_app'
 
-app = App.new
+app = SimpleSSEApp.new
 run app

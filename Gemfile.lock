@@ -29,6 +29,12 @@ GEM
       async-http (~> 0.56)
     async-pool (0.11.0)
       async (>= 2.0)
+    async-redis (0.13.0)
+      async (~> 2.10)
+      async-pool (~> 0.2)
+      io-endpoint (~> 0.10)
+      io-stream (~> 0.4)
+      protocol-redis (~> 0.11)
     async-service (0.14.4)
       async
       async-container (~> 0.16)
@@ -74,6 +80,7 @@ GEM
       io-stream (>= 0.10)
       protocol-http (~> 0.43)
       rack (>= 1.0)
+    protocol-redis (0.13.0)
     rack (3.2.1)
     samovar (2.3.0)
       console (~> 1.0)
@@ -87,7 +94,9 @@ PLATFORMS
 
 DEPENDENCIES
   async
+  async-redis
   falcon (~> 0.51.1)
+  json
   rack
 
 BUNDLED WITH

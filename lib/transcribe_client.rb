@@ -28,7 +28,7 @@ class TranscribeClient
 
     begin
       initialize_client
-      start_transcription
+      start_transcription_async
     rescue => e
       @logger.error "Failed to start: #{e.message}"
       @running.make_false
@@ -52,6 +52,10 @@ class TranscribeClient
         @logger.error "Error signaling end: #{e.message}"
       end
     end
+
+    # Kill threads
+    @audio_thread.kill if @audio_thread && @audio_thread.alive?
+    @monitor_thread.kill if @monitor_thread && @monitor_thread.alive?
   end
 
   def running?
@@ -66,7 +70,7 @@ class TranscribeClient
     )
   end
 
-  def start_transcription
+  def start_transcription_async
     @logger.info "Starting transcription with language: #{@language_code}"
 
     request_params = build_request_params
@@ -125,26 +129,25 @@ class TranscribeClient
 
     # Now that the stream is established, start sending audio
     @logger.info "Starting audio transmission..."
-    audio_thread = Thread.new { send_audio_chunks(input_stream) }
+    @audio_thread = Thread.new { send_audio_chunks(input_stream) }
 
-    # Store the thread for cleanup
-    @audio_thread = audio_thread
-
-    # Wait for the transcription to complete
-    begin
-      @logger.info "Waiting for transcription stream..."
-      result = @async_response.wait
-      # @async_response.join!
-      @logger.info "Transcription stream completed: #{result.inspect}"
-    rescue => e
-      @logger.error "Transcription stream error: #{e.message}"
-      @running.make_false
-    ensure
-      # Ensure audio thread is stopped
-      @running.make_false
-      # audio_thread.kill
-      audio_thread.kill if audio_thread && audio_thread.alive?
+    # Start a monitoring thread instead of blocking
+    @monitor_thread = Thread.new do
+      begin
+        @logger.info "Monitoring transcription stream..."
+        result = @async_response.wait
+        @logger.info "Transcription stream completed: #{result.inspect}"
+      rescue => e
+        @logger.error "Transcription stream error: #{e.message}"
+        @running.make_false
+      ensure
+        # Ensure audio thread is stopped
+        @running.make_false
+        @audio_thread.kill if @audio_thread && @audio_thread.alive?
+      end
     end
+
+    @logger.info "Transcription started successfully (non-blocking)"
   end
 
   def build_request_params

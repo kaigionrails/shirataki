@@ -58,7 +58,7 @@ class RtmpTranscribeService
         @logger.info "Audio buffer ready (size: #{@audio_stream.buffer.size})"
       end
 
-      # Start Transcribe client
+      # Start Transcribe client (non-blocking)
       @transcribe_client = TranscribeClient.new(logger: @logger)
       @transcribe_client.start(@audio_stream)
 
@@ -94,17 +94,21 @@ class RtmpTranscribeService
   def start_redis_publisher
     @redis_task = Async do
       last_processed_index = 0
+      @logger.info "Redis publisher started"
 
       while @running
         begin
           # Check for new transcription results
           results = @transcribe_client.results
+          @logger.debug "Checking results: current size=#{results.size}, last_processed=#{last_processed_index}" if ENV['DEBUG']
 
           if results.size > last_processed_index
             # Process new results
             new_results = results[last_processed_index..-1]
+            @logger.info "Processing #{new_results.size} new transcription results"
 
             Async::Redis::Client.open(@redis_endpoint) do |client|
+              @logger.debug "Redis client connected" if ENV['DEBUG']
               new_results.each do |result|
                 publish_to_redis(client, result)
               end
@@ -118,13 +122,17 @@ class RtmpTranscribeService
 
         rescue => e
           @logger.error "Redis publisher error: #{e.message}"
+          @logger.error e.backtrace.first(3).join("\n") if e.backtrace
           sleep(1)
         end
       end
+      @logger.info "Redis publisher stopped"
     end
   end
 
   def publish_to_redis(client, result)
+    @logger.debug "Publishing result to Redis: #{result[:text][0..50]}..." if ENV['DEBUG']
+
     # Prepare message for Redis Stream
     message_data = {
       'room' => @room,

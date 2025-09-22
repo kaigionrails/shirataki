@@ -1,6 +1,7 @@
 require 'open3'
 require 'concurrent'
 require 'logger'
+require 'sentry-ruby'
 
 class FFmpegAudioStream
   attr_reader :buffer
@@ -38,6 +39,7 @@ class FFmpegAudioStream
         @ffmpeg_process.value
       rescue => e
         @logger.error "Error stopping FFmpeg: #{e.message}"
+        Sentry.capture_exception(e)
       end
     end
 
@@ -134,11 +136,24 @@ class FFmpegAudioStream
 
       rescue => e
         @logger.error "Error reading audio: #{e.message}"
+
+        Sentry.capture_exception(e) do |scope|
+          scope.set_tag('component', 'ffmpeg_audio_reader')
+          scope.set_context('stream', {
+            buffer_size: @buffer.size,
+            rtmp_url: @rtmp_url
+          })
+        end
+
         break
       end
     end
   rescue => e
     @logger.error "Audio thread error: #{e.message}"
+
+    Sentry.capture_exception(e) do |scope|
+      scope.set_tag('component', 'ffmpeg_audio_thread')
+    end
   ensure
     @logger.info "Audio stream thread stopped"
   end
@@ -152,6 +167,14 @@ class FFmpegAudioStream
         # Only log important FFmpeg messages
         if line.include?('error') || line.include?('Error')
           @logger.error "[FFmpeg] #{line.strip}"
+
+          # Report critical FFmpeg errors to Sentry
+          if line.downcase.include?('fatal')
+            Sentry.capture_message(
+              "FFmpeg fatal error: #{line.strip}",
+              level: 'error'
+            )
+          end
         elsif line.include?('warning') || line.include?('Warning')
           @logger.warn "[FFmpeg] #{line.strip}"
         elsif ENV['DEBUG']
@@ -160,11 +183,20 @@ class FFmpegAudioStream
 
       rescue => e
         @logger.error "Error reading stderr: #{e.message}"
+
+        Sentry.capture_exception(e) do |scope|
+          scope.set_tag('component', 'ffmpeg_stderr_reader')
+        end
+
         break
       end
     end
   rescue => e
     @logger.error "Error thread error: #{e.message}"
+
+    Sentry.capture_exception(e) do |scope|
+      scope.set_tag('component', 'ffmpeg_error_thread')
+    end
   ensure
     @logger.info "Error stream thread stopped"
   end

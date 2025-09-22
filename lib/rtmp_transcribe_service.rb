@@ -2,6 +2,7 @@ require 'async'
 require 'async/redis'
 require 'json'
 require 'logger'
+require 'sentry-ruby'
 require_relative 'ffmpeg_audio_stream'
 require_relative 'transcribe_client'
 
@@ -71,6 +72,16 @@ class RtmpTranscribeService
     rescue => e
       @logger.error "Error: #{e.message}"
       @logger.error e.backtrace.first(5).join("\n") if e.backtrace
+
+      # Report to Sentry with context
+      Sentry.capture_exception(e) do |scope|
+        scope.set_context('rtmp_service', {
+          rtmp_url: @rtmp_url,
+          room: @room,
+          test_mode: @test_mode
+        })
+      end
+
       stop
     end
   end
@@ -123,6 +134,16 @@ class RtmpTranscribeService
         rescue => e
           @logger.error "Redis publisher error: #{e.message}"
           @logger.error e.backtrace.first(3).join("\n") if e.backtrace
+
+          # Report to Sentry
+          Sentry.capture_exception(e) do |scope|
+            scope.set_tag('component', 'redis_publisher')
+            scope.set_context('redis', {
+              endpoint: @redis_endpoint.to_s,
+              stream_key: @stream_key
+            })
+          end
+
           sleep(1)
         end
       end
@@ -168,6 +189,12 @@ class RtmpTranscribeService
 
   rescue => e
     @logger.error "Failed to publish to Redis: #{e.message}"
+
+    # Report to Sentry with message context
+    Sentry.capture_exception(e) do |scope|
+      scope.set_tag('component', 'redis_publish')
+      scope.set_context('message', result)
+    end
   end
 
   def monitor_services
@@ -177,11 +204,25 @@ class RtmpTranscribeService
       # Check if components are still running
       unless @audio_stream&.running?
         @logger.error "Audio stream stopped unexpectedly"
+
+        # Report to Sentry
+        Sentry.capture_message(
+          "Audio stream stopped unexpectedly",
+          level: 'error'
+        )
+
         break
       end
 
       unless @transcribe_client&.running?
         @logger.error "Transcribe client stopped unexpectedly"
+
+        # Report to Sentry
+        Sentry.capture_message(
+          "Transcribe client stopped unexpectedly",
+          level: 'error'
+        )
+
         break
       end
 

@@ -3,6 +3,7 @@ require 'async/redis'
 require 'rack'
 require 'json'
 require 'logger'
+require 'sentry-ruby'
 
 class RedisStreamsSSEApp
   def initialize(logger: nil)
@@ -48,6 +49,15 @@ class RedisStreamsSSEApp
     language = request.params['language'] || 'ja'
     room = request.params['room'] || 'default'
 
+    # Set Sentry context for this request
+    Sentry.configure_scope do |scope|
+      scope.set_context('sse_stream', {
+        room: room,
+        language: language,
+        path: request.path
+      })
+    end
+
     [200, headers, RedisStreamSSE.new(@redis_endpoint, @stream_key, room, language, logger: @logger)]
   end
 
@@ -68,6 +78,7 @@ class RedisStreamsSSEApp
       end
     end.wait
   rescue => e
+    Sentry.capture_exception(e)
     "error: #{e.message}"
   end
 end
@@ -118,6 +129,15 @@ class RedisStreamSSE
     heartbeat_task.stop
 
   rescue => e
+    # Report to Sentry with SSE context
+    Sentry.capture_exception(e) do |scope|
+      scope.set_context('sse', {
+        room: @room,
+        language: @language,
+        last_id: @last_id
+      })
+    end
+
     yield "event: error\n"
     yield "data: #{JSON.generate({ error: e.message })}\n\n"
   ensure
@@ -176,6 +196,16 @@ class RedisStreamSSE
 
             rescue => e
               @logger.error "Error reading stream: #{e.message}"
+
+              # Report to Sentry
+              Sentry.capture_exception(e) do |scope|
+                scope.set_tag('component', 'redis_stream_reader')
+                scope.set_context('stream', {
+                  stream_key: @stream_key,
+                  last_id: @last_id
+                })
+              end
+
               yield 'error', JSON.generate({ error: e.message })
               sleep 1
             end
@@ -183,6 +213,15 @@ class RedisStreamSSE
         end
       rescue => e
         @logger.error "Redis connection error: #{e.message}"
+
+        # Report to Sentry
+        Sentry.capture_exception(e) do |scope|
+          scope.set_tag('component', 'redis_connection')
+          scope.set_context('redis', {
+            endpoint: @redis_endpoint.to_s
+          })
+        end
+
         yield 'error', JSON.generate({ error: "Redis connection failed: #{e.message}" })
 
         # Retry connection after 5 seconds

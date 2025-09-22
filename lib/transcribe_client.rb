@@ -2,6 +2,7 @@ require 'aws-sdk-transcribestreamingservice'
 require 'concurrent'
 require 'json'
 require 'logger'
+require 'sentry-ruby'
 
 class TranscribeClient
   attr_reader :results
@@ -31,6 +32,16 @@ class TranscribeClient
       start_transcription_async
     rescue => e
       @logger.error "Failed to start: #{e.message}"
+
+      # Report to Sentry
+      Sentry.capture_exception(e) do |scope|
+        scope.set_tag('component', 'transcribe_client')
+        scope.set_context('transcribe', {
+          language_code: @language_code,
+          region: @region
+        })
+      end
+
       @running.make_false
       raise
     end
@@ -50,6 +61,7 @@ class TranscribeClient
         @logger.debug "Stream already closed during shutdown" if ENV['DEBUG']
       rescue => e
         @logger.error "Error signaling end: #{e.message}"
+        Sentry.capture_exception(e)
       end
     end
 
@@ -90,16 +102,34 @@ class TranscribeClient
 
     output_stream.on_bad_request_exception_event do |event|
       @logger.error "Bad request: #{event.message}"
+
+      Sentry.capture_message(
+        "AWS Transcribe bad request: #{event.message}",
+        level: 'error'
+      )
+
       @running.make_false
     end
 
     output_stream.on_limit_exceeded_exception_event do |event|
       @logger.error "Limit exceeded: #{event.message}"
+
+      Sentry.capture_message(
+        "AWS Transcribe limit exceeded: #{event.message}",
+        level: 'error'
+      )
+
       @running.make_false
     end
 
     output_stream.on_internal_failure_exception_event do |event|
       @logger.error "Internal failure: #{event.message}"
+
+      Sentry.capture_message(
+        "AWS Transcribe internal failure: #{event.message}",
+        level: 'error'
+      )
+
       @running.make_false
     end
 
@@ -110,6 +140,12 @@ class TranscribeClient
 
     output_stream.on_service_unavailable_exception_event do |event|
       @logger.error "Service unavailable: #{event.message}"
+
+      Sentry.capture_message(
+        "AWS Transcribe service unavailable: #{event.message}",
+        level: 'error'
+      )
+
       @running.make_false
     end
 
@@ -139,6 +175,11 @@ class TranscribeClient
         @logger.info "Transcription stream completed: #{result.inspect}"
       rescue => e
         @logger.error "Transcription stream error: #{e.message}"
+
+        Sentry.capture_exception(e) do |scope|
+          scope.set_tag('component', 'transcribe_monitor')
+        end
+
         @running.make_false
       ensure
         # Ensure audio thread is stopped
@@ -209,10 +250,24 @@ class TranscribeClient
 
       rescue HTTP2::Error::StreamClosed => e
         @logger.error "AWS Transcribe stream unexpectedly closed: #{e.message}"
+
+        Sentry.capture_exception(e) do |scope|
+          scope.set_tag('component', 'audio_sender')
+          scope.set_context('stream', {
+            chunks_sent: chunks_sent,
+            total_bytes: total_bytes_sent
+          })
+        end
+
         @running.make_false
         break
       rescue => e
         @logger.error "Error sending audio: #{e.message}"
+
+        Sentry.capture_exception(e) do |scope|
+          scope.set_tag('component', 'audio_sender')
+        end
+
         @running.make_false
         break
       end
@@ -279,5 +334,9 @@ class TranscribeClient
     end
   rescue => e
     @logger.error "Error processing transcript: #{e.message}"
+
+    Sentry.capture_exception(e) do |scope|
+      scope.set_tag('component', 'transcript_processor')
+    end
   end
 end

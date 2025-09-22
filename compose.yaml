@@ -13,6 +13,50 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      - shirataki-net
+
+  # SSE Server
+  sse-server:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - REDIS_HOST=valkey
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_STREAM_KEY=transcription_stream
+    depends_on:
+      - valkey
+    volumes:
+      - ./lib:/app/lib:ro
+      - ./config.ru:/app/config.ru:ro
+    command: ["bundle", "exec", "falcon", "serve", "-b", "http://0.0.0.0:3000"]
+    networks:
+      - shirataki-net
+
+  # RTMP to Transcribe Service
+  rtmp-transcribe:
+    build: .
+    environment:
+      - REDIS_HOST=valkey
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_STREAM_KEY=transcription_stream
+      - AWS_REGION=${AWS_REGION:-ap-northeast-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - RTMP_URL=${RTMP_URL:-rtmp://localhost:1935/live}
+      - TRANSCRIBE_LANGUAGE=${TRANSCRIBE_LANGUAGE:-ja-JP}
+      - ROOM=${ROOM:-default}
+    depends_on:
+      - valkey
+    volumes:
+      - ./lib:/app/lib:ro
+      - ./bin:/app/bin:ro
+    command: ["ruby", "bin/rtmp_transcribe_server.rb"]
+    networks:
+      - shirataki-net
 
   # Optional: Redis Commander for GUI management
   redis-commander:
@@ -23,6 +67,12 @@ services:
       - "8081:8081"
     depends_on:
       - valkey
+    networks:
+      - shirataki-net
+
+networks:
+  shirataki-net:
+    driver: bridge
 
 volumes:
   valkey-data:

@@ -2,6 +2,11 @@
 
 require 'bundler/setup'
 require 'optparse'
+
+# Initialize Sentry
+require_relative '../config/sentry'
+ENV['SENTRY_COMPONENT'] = 'rtmp_transcribe_server'
+
 require_relative '../lib/rtmp_transcribe_service'
 
 # Parse command line options
@@ -114,9 +119,22 @@ end
 
 # Start the service
 begin
+  # Set Sentry context for this service
+  Sentry.configure_scope do |scope|
+    scope.set_context('service', {
+      rtmp_url: options[:rtmp_url],
+      room: options[:room],
+      test_mode: options[:test_mode]
+    })
+  end
+
   service.start
 rescue => e
   puts "Fatal error: #{e.message}"
   puts e.backtrace.first(10)
+
+  # Report to Sentry
+  Sentry.capture_exception(e)
+
   exit 1
 end

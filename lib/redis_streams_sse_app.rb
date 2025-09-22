@@ -2,15 +2,21 @@ require 'async'
 require 'async/redis'
 require 'rack'
 require 'json'
+require 'logger'
 
 class RedisStreamsSSEApp
-  def initialize
+  def initialize(logger: nil)
     @redis_endpoint = Async::Redis.local_endpoint(
       host: ENV.fetch('REDIS_HOST', 'localhost'),
       port: ENV.fetch('REDIS_PORT', 6379).to_i,
       db: ENV.fetch('REDIS_DB', 0).to_i
     )
     @stream_key = ENV.fetch('REDIS_STREAM_KEY', 'transcription_stream')
+    @logger = logger || Logger.new(STDOUT).tap do |log|
+      log.formatter = proc do |severity, datetime, progname, msg|
+        "[#{datetime.strftime('%Y-%m-%d %H:%M:%S')}] [RedisStreamsSSEApp] #{severity}: #{msg}\n"
+      end
+    end
   end
 
   def call(env)
@@ -42,7 +48,7 @@ class RedisStreamsSSEApp
     language = request.params['language'] || 'ja'
     room = request.params['room'] || 'default'
 
-    [200, headers, RedisStreamSSE.new(@redis_endpoint, @stream_key, room, language)]
+    [200, headers, RedisStreamSSE.new(@redis_endpoint, @stream_key, room, language, logger: @logger)]
   end
 
   def handle_health_check
@@ -67,12 +73,17 @@ class RedisStreamsSSEApp
 end
 
 class RedisStreamSSE
-  def initialize(redis_endpoint, stream_key, room, language)
+  def initialize(redis_endpoint, stream_key, room, language, logger: nil)
     @redis_endpoint = redis_endpoint
     @stream_key = stream_key
     @room = room
     @language = language
     @last_id = '0-0'
+    @logger = logger || Logger.new(STDOUT).tap do |log|
+      log.formatter = proc do |severity, datetime, progname, msg|
+        "[#{datetime.strftime('%Y-%m-%d %H:%M:%S')}] [RedisStreamSSE] #{severity}: #{msg}\n"
+      end
+    end
   end
 
   def each
@@ -119,7 +130,7 @@ class RedisStreamSSE
     Async do
       begin
         Async::Redis::Client.open(@redis_endpoint) do |client|
-          puts "[RedisStreamSSE] Connected to Redis, reading from stream: #{@stream_key}"
+          @logger.info "Connected to Redis, reading from stream: #{@stream_key}"
 
           loop do
             begin
@@ -154,7 +165,7 @@ class RedisStreamSSE
                     }
 
                     yield 'message', JSON.generate(message)
-                    puts "[RedisStreamSSE] Sent message: #{entry_id}"
+                    @logger.debug "Sent message: #{entry_id}" if ENV['DEBUG']
                   end
 
                   @last_id = entry_id
@@ -162,14 +173,14 @@ class RedisStreamSSE
               end
 
             rescue => e
-              puts "[RedisStreamSSE] Error reading stream: #{e.message}"
+              @logger.error "Error reading stream: #{e.message}"
               yield 'error', JSON.generate({ error: e.message })
               sleep 1
             end
           end
         end
       rescue => e
-        puts "[RedisStreamSSE] Redis connection error: #{e.message}"
+        @logger.error "Redis connection error: #{e.message}"
         yield 'error', JSON.generate({ error: "Redis connection failed: #{e.message}" })
 
         # Retry connection after 5 seconds

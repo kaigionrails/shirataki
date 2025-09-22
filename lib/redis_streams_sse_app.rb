@@ -78,7 +78,8 @@ class RedisStreamSSE
     @stream_key = stream_key
     @room = room
     @language = language
-    @last_id = '0-0'
+    # Use '$' to start reading only new messages from connection time
+    @last_id = '$'
     @logger = logger || Logger.new(STDOUT).tap do |log|
       log.formatter = proc do |severity, datetime, progname, msg|
         "[#{datetime.strftime('%Y-%m-%d %H:%M:%S')}] [RedisStreamSSE] #{severity}: #{msg}\n"
@@ -130,12 +131,13 @@ class RedisStreamSSE
     Async do
       begin
         Async::Redis::Client.open(@redis_endpoint) do |client|
-          @logger.info "Connected to Redis, reading from stream: #{@stream_key}"
+          @logger.info "Connected to Redis, reading new messages from stream: #{@stream_key} (starting from: #{@last_id})"
 
           loop do
             begin
               # XREAD with block timeout of 5 seconds
               # Format: XREAD BLOCK 5000 STREAMS stream_key last_id
+              # Using '$' initially means we only get messages that arrive after connection
               result = client.call('XREAD', 'BLOCK', '5000', 'STREAMS', @stream_key, @last_id)
 
               if result && result.is_a?(Array) && !result.empty?

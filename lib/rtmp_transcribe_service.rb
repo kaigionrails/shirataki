@@ -2,9 +2,12 @@ require 'async'
 require 'async/redis'
 require 'json'
 require 'logger'
+require 'concurrent'
+require 'digest'
 require 'sentry-ruby'
 require_relative 'ffmpeg_audio_stream'
 require_relative 'transcribe_client'
+require_relative 'bedrock_translate_client'
 
 class RtmpTranscribeService
   def initialize(rtmp_url: nil, room: 'default', test_mode: false, logger: nil)
@@ -13,6 +16,7 @@ class RtmpTranscribeService
     @test_mode = test_mode
     @audio_stream = nil
     @transcribe_client = nil
+    @translate_client = nil
     @redis_endpoint = Async::Redis.local_endpoint(
       host: ENV.fetch('REDIS_HOST', 'localhost'),
       port: ENV.fetch('REDIS_PORT', 6379).to_i,
@@ -21,6 +25,9 @@ class RtmpTranscribeService
     @stream_key = ENV.fetch('REDIS_STREAM_KEY', 'transcription_stream')
     @running = false
     @redis_task = nil
+    @translation_queue = Concurrent::Array.new
+    @translated_texts = Concurrent::Hash.new  # Track already translated text to avoid duplicates
+    @min_translation_length = ENV.fetch('MIN_TRANSLATION_LENGTH', '20').to_i  # Minimum characters for translation
     @logger = logger || Logger.new(STDOUT).tap do |log|
       log.formatter = proc do |severity, datetime, progname, msg|
         "[#{datetime.strftime('%Y-%m-%d %H:%M:%S')}] [RtmpTranscribeService] #{severity}: #{msg}\n"
@@ -63,6 +70,15 @@ class RtmpTranscribeService
       @transcribe_client = TranscribeClient.new(logger: @logger)
       @transcribe_client.start(@audio_stream)
 
+      # Start Translation client
+      @translate_client = BedrockTranslateClient.new(logger: @logger)
+      if @translate_client.enabled?
+        @logger.info "Translation enabled"
+        start_translation_processor
+      else
+        @logger.info "Translation disabled"
+      end
+
       # Start Redis publishing task
       start_redis_publisher
 
@@ -94,6 +110,7 @@ class RtmpTranscribeService
 
     # Stop components
     @redis_task&.stop
+    @translation_task&.stop if @translation_task
     @transcribe_client&.stop
     @audio_stream&.stop
 
@@ -121,7 +138,13 @@ class RtmpTranscribeService
             Async::Redis::Client.open(@redis_endpoint) do |client|
               @logger.debug "Redis client connected" if ENV['DEBUG']
               new_results.each do |result|
+                # Publish original transcription
                 publish_to_redis(client, result)
+
+                # Queue for translation if enabled and text is long enough
+                if @translate_client&.enabled? && should_translate?(result)
+                  @translation_queue << result
+                end
               end
             end
 
@@ -151,6 +174,76 @@ class RtmpTranscribeService
     end
   end
 
+  def start_translation_processor
+    @translation_task = Async do
+      @logger.info "Translation processor started"
+      @logger.info "Minimum translation length: #{@min_translation_length} characters"
+
+      while @running
+        begin
+          # Process translation queue
+          if @translation_queue.size > 0
+            result = @translation_queue.shift
+            text_to_translate = result[:text]
+
+            # Skip if we've already translated this exact text
+            text_hash = Digest::MD5.hexdigest(text_to_translate)
+            if @translated_texts[text_hash]
+              @logger.debug "Skipping already translated text: #{text_to_translate[0..30]}..." if ENV['DEBUG']
+              next
+            end
+
+            @logger.info "Translating #{result[:is_final] ? 'final' : 'partial'}: #{text_to_translate[0..50]}..."
+
+            # Translate the text
+            translated_text = @translate_client.translate(text_to_translate)
+
+            if translated_text
+              # Mark this text as translated
+              @translated_texts[text_hash] = true
+
+              # Clean up old entries if cache gets too large
+              if @translated_texts.size > 1000
+                @translated_texts.clear
+                @logger.debug "Cleared translation cache" if ENV['DEBUG']
+              end
+
+              # Create a new result for the translation
+              translation_result = {
+                text: translated_text,
+                is_final: result[:is_final],  # Preserve the original final state
+                timestamp: Time.now.iso8601,
+                language: 'en',  # English translation
+                original_language: result[:language] || 'ja',
+                translation_of: text_to_translate,
+                type: 'translation'
+              }
+
+              # Publish the translation to Redis
+              Async::Redis::Client.open(@redis_endpoint) do |client|
+                publish_to_redis(client, translation_result)
+              end
+            end
+          end
+
+          # Check every 100ms
+          sleep(0.1)
+
+        rescue => e
+          @logger.error "Translation processor error: #{e.message}"
+
+          Sentry.capture_exception(e) do |scope|
+            scope.set_tag('component', 'translation_processor')
+          end
+
+          sleep(1)
+        end
+      end
+
+      @logger.info "Translation processor stopped"
+    end
+  end
+
   def publish_to_redis(client, result)
     @logger.debug "Publishing result to Redis: #{result[:text][0..50]}..." if ENV['DEBUG']
 
@@ -161,7 +254,7 @@ class RtmpTranscribeService
       'text' => result[:text],
       'is_final' => result[:is_final].to_s,
       'timestamp' => result[:timestamp],
-      'type' => 'transcription'
+      'type' => result[:type] || 'transcription'
     }
 
     # Add confidence if available
@@ -174,11 +267,21 @@ class RtmpTranscribeService
       message_data['speakers'] = result[:speakers].join(',')
     end
 
+    # Add translation-specific fields if this is a translation
+    if result[:type] == 'translation'
+      message_data['original_language'] = result[:original_language] if result[:original_language]
+      message_data['translation_of'] = result[:translation_of] if result[:translation_of]
+    end
+
     # Publish to Redis Stream
     stream_id = client.call('XADD', @stream_key, '*', *message_data.flatten)
 
     if result[:is_final]
-      @logger.info "Published final transcription: #{result[:text][0..50]}..."
+      if result[:type] == 'translation'
+        @logger.info "Published translation: #{result[:text][0..50]}..."
+      else
+        @logger.info "Published final transcription: #{result[:text][0..50]}..."
+      end
       @logger.info "  Stream ID: #{stream_id}"
     elsif ENV['DEBUG']
       @logger.debug "Published partial: #{result[:text][0..30]}..."
@@ -238,5 +341,22 @@ class RtmpTranscribeService
 
     @logger.info "Monitor loop ended"
     stop
+  end
+
+  def should_translate?(result)
+    text = result[:text]
+    return false if text.nil? || text.strip.empty?
+
+    # Translate if it's final OR if it's long enough
+    if result[:is_final]
+      @logger.debug "Queueing final text for translation" if ENV['DEBUG']
+      return true
+    elsif text.length >= @min_translation_length
+      @logger.debug "Queueing partial text for translation (length: #{text.length})" if ENV['DEBUG']
+      return true
+    else
+      @logger.debug "Skipping translation - text too short (length: #{text.length}, min: #{@min_translation_length})" if ENV['DEBUG']
+      return false
+    end
   end
 end

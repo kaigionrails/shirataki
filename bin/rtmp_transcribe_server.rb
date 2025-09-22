@@ -83,6 +83,13 @@ puts "  Redis: #{ENV.fetch('REDIS_HOST', 'localhost')}:#{ENV.fetch('REDIS_PORT',
 puts "  Stream Key: #{ENV.fetch('REDIS_STREAM_KEY', 'transcription_stream')}"
 puts "  Language: #{ENV.fetch('TRANSCRIBE_LANGUAGE', 'ja-JP')}"
 puts "  AWS Region: #{ENV.fetch('AWS_REGION', 'ap-northeast-1')}"
+puts ""
+puts "Translation:"
+puts "  Enabled: #{ENV.fetch('ENABLE_TRANSLATION', 'false')}"
+if ENV.fetch('ENABLE_TRANSLATION', 'false').downcase == 'true'
+  puts "  Bedrock Model: #{ENV.fetch('BEDROCK_MODEL_ID', 'anthropic.claude-3-5-sonnet-20240620-v1:0')}"
+  puts "  Bedrock Region: #{ENV.fetch('BEDROCK_REGION', 'ap-northeast-1')}"
+end
 puts "=" * 60
 puts ""
 
@@ -128,7 +135,13 @@ begin
     })
   end
 
-  service.start
+  # Wrap service.start in Async reactor for proper async task handling
+  require 'async'
+
+  Async do
+    service.start
+  end
+
 rescue => e
   puts "Fatal error: #{e.message}"
   puts e.backtrace.first(10)

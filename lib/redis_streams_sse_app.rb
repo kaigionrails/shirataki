@@ -141,7 +141,7 @@ class RedisStreamSSE
                   # Convert field array to hash
                   data = {}
                   fields.each_slice(2) do |key, value|
-                    data[key] = value
+                    data[key] = value.force_encoding('UTF-8')
                   end
 
                   # Filter by room and language if specified in the data

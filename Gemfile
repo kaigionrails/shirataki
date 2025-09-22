@@ -12,6 +12,9 @@ gem "json"
 gem "aws-sdk-transcribestreamingservice"
 gem "aws-sdk-translate"
 
+# AWS SDK for Amazon Bedrock (for Claude translation)
+gem "aws-sdk-bedrockruntime"
+
 # Required for AWS Transcribe Streaming async client
 gem "http-2"
 

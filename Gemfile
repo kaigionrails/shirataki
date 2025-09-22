@@ -17,3 +17,6 @@ gem "http-2"
 
 # Concurrent processing
 gem "concurrent-ruby"
+
+# Error tracking and monitoring
+gem "sentry-ruby"

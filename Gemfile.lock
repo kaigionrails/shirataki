@@ -109,6 +109,9 @@ GEM
     samovar (2.3.0)
       console (~> 1.0)
       mapping (~> 1.0)
+    sentry-ruby (5.27.0)
+      bigdecimal
+      concurrent-ruby (~> 1.0, >= 1.0.2)
     string-format (0.2.0)
     traces (0.18.2)
 
@@ -126,6 +129,7 @@ DEPENDENCIES
   http-2
   json
   rack
+  sentry-ruby
 
 BUNDLED WITH
    2.6.7

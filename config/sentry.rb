@@ -35,17 +35,19 @@ Sentry.init do |config|
     event
   end
 
-  # Set additional tags
-  config.set_tags(
-    service: 'shirataki',
-    component: ENV['SENTRY_COMPONENT'] || 'unknown'
-  )
-
   # Capture additional context
   config.before_breadcrumb = lambda do |breadcrumb, hint|
     # Add additional context to breadcrumbs if needed
     breadcrumb
   end
+end
+
+# Set global tags after initialization
+Sentry.configure_scope do |scope|
+  scope.set_tags(
+    service: 'shirataki',
+    component: ENV['SENTRY_COMPONENT'] || 'unknown'
+  )
 end
 
 # Helper method to set user/room context

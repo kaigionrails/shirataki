@@ -3,6 +3,8 @@ require 'async/redis'
 require 'rack'
 require 'json'
 require 'logger'
+require 'securerandom'
+require 'concurrent'
 require 'sentry-ruby'
 
 class RedisStreamsSSEApp
@@ -13,11 +15,15 @@ class RedisStreamsSSEApp
       db: ENV.fetch('REDIS_DB', 0).to_i
     )
     @stream_key = ENV.fetch('REDIS_STREAM_KEY', 'transcription_stream')
+    @connected_clients = Concurrent::Hash.new
     @logger = logger || Logger.new(STDOUT).tap do |log|
       log.formatter = proc do |severity, datetime, progname, msg|
         "[#{datetime.strftime('%Y-%m-%d %H:%M:%S')}] [RedisStreamsSSEApp] #{severity}: #{msg}\n"
       end
     end
+
+    # Start monitoring thread for client connections
+    start_connection_monitor
   end
 
   def call(env)
@@ -58,7 +64,24 @@ class RedisStreamsSSEApp
       })
     end
 
-    [200, headers, RedisStreamSSE.new(@redis_endpoint, @stream_key, room, language, logger: @logger)]
+    # Create SSE stream and track it
+    client_id = SecureRandom.uuid
+    sse_stream = RedisStreamSSE.new(@redis_endpoint, @stream_key, room, language,
+                                     logger: @logger,
+                                     client_id: client_id,
+                                     on_close: -> { @connected_clients.delete(client_id) })
+
+    # Track this client
+    @connected_clients[client_id] = {
+      connected_at: Time.now,
+      room: room,
+      language: language,
+      remote_ip: request.ip
+    }
+
+    @logger.info "New SSE client connected: #{client_id} from #{request.ip} (room: #{room}, language: #{language})"
+
+    [200, headers, sse_stream]
   end
 
   def handle_health_check
@@ -81,14 +104,41 @@ class RedisStreamsSSEApp
     Sentry.capture_exception(e)
     "error: #{e.message}"
   end
+
+  private
+
+  def start_connection_monitor
+    Thread.new do
+      loop do
+        sleep(30)  # Log every 30 seconds
+
+        active_count = @connected_clients.size
+        if active_count > 0
+          # Group clients by room and language
+          room_stats = @connected_clients.values.group_by { |c| "#{c[:room]}/#{c[:language]}" }
+                                                 .transform_values(&:count)
+
+          # Format room statistics as a single line
+          room_details = room_stats.map { |room_lang, count| "#{room_lang}: #{count}" }.join(', ')
+          @logger.info "Connected clients: #{active_count} total (#{room_details})"
+        else
+          @logger.debug "No active SSE connections" if ENV['DEBUG']
+        end
+      rescue => e
+        @logger.error "Connection monitor error: #{e.message}"
+      end
+    end
+  end
 end
 
 class RedisStreamSSE
-  def initialize(redis_endpoint, stream_key, room, language, logger: nil)
+  def initialize(redis_endpoint, stream_key, room, language, logger: nil, client_id: nil, on_close: nil)
     @redis_endpoint = redis_endpoint
     @stream_key = stream_key
     @room = room
     @language = language
+    @client_id = client_id || SecureRandom.uuid
+    @on_close = on_close
     # Use '$' to start reading only new messages from connection time
     @last_id = '$'
     @logger = logger || Logger.new(STDOUT).tap do |log|
@@ -106,8 +156,11 @@ class RedisStreamSSE
       stream: @stream_key,
       room: @room,
       language: @language,
+      client_id: @client_id,
       timestamp: Time.now.iso8601
     })}\n\n"
+
+    @logger.debug "SSE stream started for client #{@client_id}" if ENV['DEBUG']
 
     # Start reading from Redis Streams
     redis_task = read_redis_stream { |event, data|
@@ -143,6 +196,10 @@ class RedisStreamSSE
   ensure
     redis_task&.stop
     heartbeat_task&.stop
+
+    # Call cleanup callback
+    @on_close&.call
+    @logger.info "SSE client disconnected: #{@client_id}"
   end
 
   private

@@ -22,9 +22,16 @@ Sentry.init do |config|
   # Filter sensitive data
   config.before_send = lambda do |event, hint|
     # Filter out AWS credentials from the event
-    if event.extra
-      event.extra.deep_stringify_keys!
-      event.extra.delete_if { |k, _| k.match?(/aws|key|secret|password|token/i) }
+    if event.extra && event.extra.is_a?(Hash)
+      # Convert keys to strings recursively
+      filtered_extra = {}
+      event.extra.each do |k, v|
+        key_str = k.to_s
+        # Skip sensitive keys
+        next if key_str.match?(/aws|key|secret|password|token/i)
+        filtered_extra[key_str] = v
+      end
+      event.extra = filtered_extra
     end
 
     # Filter environment variables

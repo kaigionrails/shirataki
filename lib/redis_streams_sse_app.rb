@@ -172,8 +172,14 @@ class RedisStreamSSE
     heartbeat_task = Async do
       loop do
         sleep 30
-        yield "event: heartbeat\n"
-        yield "data: #{JSON.generate({ timestamp: Time.now.iso8601 })}\n\n"
+        begin
+          yield "event: heartbeat\n"
+          yield "data: #{JSON.generate({ timestamp: Time.now.iso8601 })}\n\n"
+        rescue Errno::EPIPE, IOError => e
+          # Client disconnected - this is normal behavior
+          @logger.debug "Client #{@client_id} disconnected during heartbeat: #{e.class}" if ENV['DEBUG']
+          break
+        end
       end
     end
 
@@ -181,8 +187,11 @@ class RedisStreamSSE
     redis_task.wait
     heartbeat_task.stop
 
+  rescue Errno::EPIPE, IOError => e
+    # Client disconnected - this is normal, don't report to Sentry
+    @logger.info "SSE client #{@client_id} disconnected: #{e.class.name}"
   rescue => e
-    # Report to Sentry with SSE context
+    # Report other errors to Sentry with SSE context
     Sentry.capture_exception(e) do |scope|
       scope.set_context('sse', {
         room: @room,
@@ -191,8 +200,13 @@ class RedisStreamSSE
       })
     end
 
-    yield "event: error\n"
-    yield "data: #{JSON.generate({ error: e.message })}\n\n"
+    begin
+      yield "event: error\n"
+      yield "data: #{JSON.generate({ error: e.message })}\n\n"
+    rescue Errno::EPIPE, IOError
+      # Client already disconnected, can't send error message
+      @logger.debug "Could not send error to disconnected client #{@client_id}" if ENV['DEBUG']
+    end
   ensure
     redis_task&.stop
     heartbeat_task&.stop
@@ -243,8 +257,14 @@ class RedisStreamSSE
                       timestamp: Time.now.iso8601
                     }
 
-                    yield 'message', JSON.generate(message)
-                    @logger.debug "Sent message: #{entry_id}" if ENV['DEBUG']
+                    begin
+                      yield 'message', JSON.generate(message)
+                      @logger.debug "Sent message: #{entry_id}" if ENV['DEBUG']
+                    rescue Errno::EPIPE, IOError => e
+                      # Client disconnected while sending message
+                      @logger.debug "Client #{@client_id} disconnected while sending message: #{e.class}" if ENV['DEBUG']
+                      return  # Exit the read_redis_stream method
+                    end
                   end
 
                   @last_id = entry_id

@@ -14,6 +14,7 @@ class TranscribeClient
     @running = Concurrent::AtomicBoolean.new(false)
     @client = nil
     @stream = nil
+    @max_results_size = ENV.fetch('MAX_RESULTS_SIZE', '1000').to_i
     @logger = logger || Logger.new(STDOUT).tap do |log|
       log.formatter = proc do |severity, datetime, progname, msg|
         "[#{datetime.strftime('%Y-%m-%d %H:%M:%S')}] [TranscribeClient] #{severity}: #{msg}\n"
@@ -205,6 +206,11 @@ class TranscribeClient
       params[:vocabulary_name] = ENV['TRANSCRIBE_VOCABULARY']
     end
 
+    # Add language model name if specified
+    if ENV['TRANSCRIBE_LANGUAGE_MODEL_NAME']
+      params[:language_model_name] = ENV['TRANSCRIBE_LANGUAGE_MODEL_NAME']
+    end
+
     # Enable speaker identification for supported languages
     if ['en-US', 'en-GB', 'es-US', 'fr-CA', 'fr-FR', 'de-DE'].include?(@language_code)
       params[:show_speaker_label] = true
@@ -324,13 +330,9 @@ class TranscribeClient
       if result_data[:is_final]
         @logger.info "Final: #{text}"
       else
-        @logger.info "Partial: #{text}"
+        @logger.debug "Partial: #{text}" if ENV['DEBUG']
       end
 
-      # Keep results array size manageable
-      if @results.size > 1000
-        @results.shift(100)
-      end
     end
   rescue => e
     @logger.error "Error processing transcript: #{e.message}"

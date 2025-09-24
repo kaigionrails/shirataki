@@ -26,6 +26,7 @@ class RtmpTranscribeService
     @translation_queue = Concurrent::Array.new
     @translated_texts = Concurrent::Hash.new  # Track already translated text to avoid duplicates
     @min_translation_length = ENV.fetch('MIN_TRANSLATION_LENGTH', '20').to_i  # Minimum characters for translation
+    @translation_batch_timeout = ENV.fetch('TRANSLATION_BATCH_TIMEOUT', '2').to_f  # Batch timeout in seconds
     @logger = logger || Logger.new(STDOUT).tap do |log|
       log.formatter = proc do |severity, datetime, progname, msg|
         "[#{datetime.strftime('%Y-%m-%d %H:%M:%S')}] [RtmpTranscribeService] #{severity}: #{msg}\n"
@@ -273,56 +274,83 @@ class RtmpTranscribeService
     @translation_task = Async do
       @logger.info "Translation processor started"
       @logger.info "Minimum translation length: #{@min_translation_length} characters"
+      @logger.info "Batch size: #{@translate_client.batch_size}, Timeout: #{@translation_batch_timeout}s"
+      @logger.info "Translate only final: #{@translate_client.translate_only_final?}"
+
+      batch = []
+      last_batch_time = Time.now
 
       while @running
         begin
-          # Process translation queue
-          if @translation_queue.size > 0
+          # Collect items for batch processing
+          while @translation_queue.size > 0 && batch.size < @translate_client.batch_size
             result = @translation_queue.shift
-            text_to_translate = result[:text]
 
-            # Skip if we've already translated this exact text
-            text_hash = Digest::MD5.hexdigest(text_to_translate)
-            if @translated_texts[text_hash]
-              @logger.debug "Skipping already translated text: #{text_to_translate[0..30]}..." if ENV['DEBUG']
+            # Skip non-final texts if configured
+            if @translate_client.translate_only_final? && !result[:is_final]
+              @logger.debug "Skipping non-final text for translation" if ENV['DEBUG']
               next
             end
 
-            if result[:is_final]
-              @logger.info "Translating final: #{text_to_translate[0..50]}..."
-            else
-              @logger.debug "Translating partial: #{text_to_translate[0..50]}..." if ENV['DEBUG']
+            # Skip if we've already translated this exact text
+            text_hash = Digest::MD5.hexdigest(result[:text])
+            if @translated_texts[text_hash]
+              @logger.debug "Skipping already translated text: #{result[:text][0..30]}..." if ENV['DEBUG']
+              next
             end
 
-            # Translate the text
-            translated_text = @translate_client.translate(text_to_translate)
+            batch << result
+          end
 
-            if translated_text
-              # Mark this text as translated
-              @translated_texts[text_hash] = true
+          # Process batch if it's full or timeout reached
+          should_process = batch.size >= @translate_client.batch_size ||
+                          (batch.size > 0 && Time.now - last_batch_time >= @translation_batch_timeout)
 
-              # Clean up old entries if cache gets too large
-              if @translated_texts.size > 1000
-                @translated_texts.clear
-                @logger.debug "Cleared translation cache" if ENV['DEBUG']
-              end
+          if should_process && batch.size > 0
+            @logger.info "Processing translation batch: #{batch.size} texts"
 
-              # Create a new result for the translation
-              translation_result = {
-                text: translated_text,
-                is_final: result[:is_final],  # Preserve the original final state
-                timestamp: Time.now.iso8601,
-                language: 'en',  # English translation
-                original_language: result[:language] || 'ja',
-                translation_of: text_to_translate,
-                type: 'translation'
-              }
+            # Extract texts for batch translation
+            texts_to_translate = batch.map { |r| r[:text] }
 
-              # Publish the translation to Redis
-              Async::Redis::Client.open(@redis_endpoint) do |client|
-                publish_to_redis(client, translation_result)
+            # Batch translate
+            translated_texts = @translate_client.translate_batch(texts_to_translate)
+
+            # Process results
+            batch.each_with_index do |result, index|
+              translated_text = translated_texts[index]
+
+              if translated_text
+                # Mark this text as translated
+                text_hash = Digest::MD5.hexdigest(result[:text])
+                @translated_texts[text_hash] = true
+
+                # Create a new result for the translation
+                translation_result = {
+                  text: translated_text,
+                  is_final: result[:is_final],
+                  timestamp: Time.now.iso8601,
+                  language: 'en',
+                  original_language: result[:language] || 'ja',
+                  translation_of: result[:text],
+                  type: 'translation'
+                }
+
+                # Publish the translation to Redis
+                Async::Redis::Client.open(@redis_endpoint) do |client|
+                  publish_to_redis(client, translation_result)
+                end
               end
             end
+
+            # Clean up old entries if cache gets too large
+            if @translated_texts.size > 1000
+              @translated_texts.clear
+              @logger.debug "Cleared translation cache" if ENV['DEBUG']
+            end
+
+            # Reset batch
+            batch.clear
+            last_batch_time = Time.now
           end
 
           # Check every 100ms

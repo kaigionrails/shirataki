@@ -52,6 +52,47 @@ class FFmpegAudioStream
     @running.value
   end
 
+  def monitor_ffmpeg_process
+    @logger.info "FFmpeg process monitor started"
+    check_count = 0
+
+    while @running.value
+      begin
+        sleep(2)
+        check_count += 1
+
+        if @ffmpeg_process.nil?
+          @logger.error "FFmpeg process is nil!"
+          @running.make_false
+          break
+        end
+
+        pid_status = Process.waitpid2(@ffmpeg_process.pid, Process::WNOHANG)
+        if pid_status
+          exit_status = pid_status[1]
+          @logger.error "FFmpeg process exited unexpectedly!"
+          @logger.error "Exit status: #{exit_status}"
+          @logger.error "Exit code: #{exit_status.exitstatus}" if exit_status.respond_to?(:exitstatus)
+          @running.make_false
+          break
+        end
+
+        # Log process status every 30 seconds
+        if check_count % 15 == 0
+          @logger.debug "FFmpeg process still running (PID: #{@ffmpeg_process.pid}, buffer: #{@buffer.size} bytes)" if ENV['DEBUG']
+        end
+
+      rescue => e
+        @logger.error "Error monitoring FFmpeg process: #{e.message}"
+        break
+      end
+    end
+
+    @logger.info "FFmpeg process monitor stopped"
+  rescue => e
+    @logger.error "FFmpeg monitor thread error: #{e.message}"
+  end
+
   def read_chunk(size = 32000)
     return nil unless running?
 
@@ -82,8 +123,19 @@ class FFmpegAudioStream
     # Start threads to read FFmpeg output
     @threads << Thread.new { read_audio_stream }
     @threads << Thread.new { read_error_stream }
+    @threads << Thread.new { monitor_ffmpeg_process }  # Add process monitor
 
     @logger.info "FFmpeg started with PID: #{@ffmpeg_process.pid}"
+
+    # Check if process is actually running
+    sleep(0.5)
+    pid_status = Process.waitpid2(@ffmpeg_process.pid, Process::WNOHANG)
+    if pid_status
+      @logger.error "FFmpeg process exited immediately after starting!"
+      @logger.error "Exit status: #{pid_status[1]}"
+    else
+      @logger.info "FFmpeg process is running"
+    end
   end
 
   def build_ffmpeg_command
@@ -125,19 +177,46 @@ class FFmpegAudioStream
   end
 
   def read_audio_stream
+    bytes_read = 0
+    chunks_read = 0
+    last_log_time = Time.now
+
+    @logger.info "Audio reader thread started"
+
     while @running.value
       begin
         # Read audio data in chunks
         chunk = @stdout.read(32000)
-        break unless chunk
+
+        if chunk.nil?
+          @logger.warn "Audio stream ended (read returned nil)"
+          break
+        end
+
+        if chunk.empty?
+          @logger.debug "Read empty chunk from FFmpeg stdout" if ENV['DEBUG']
+          next
+        end
+
+        chunk_size = chunk.bytesize
+        bytes_read += chunk_size
+        chunks_read += 1
 
         # Add bytes to buffer
         chunk.bytes.each { |byte| @buffer << byte }
 
+        # Log progress every 5 seconds
+        if Time.now - last_log_time > 5
+          @logger.info "Audio reader stats: chunks=#{chunks_read}, bytes=#{bytes_read}, buffer_size=#{@buffer.size}"
+          last_log_time = Time.now
+        end
+
         # Keep buffer size reasonable (max ~10 seconds of audio)
         if @buffer.size > 32000
           # Remove oldest data
-          (@buffer.size - 32000).times { @buffer.shift }
+          removed = @buffer.size - 32000
+          removed.times { @buffer.shift }
+          @logger.debug "Buffer overflow: removed #{removed} bytes" if ENV['DEBUG']
         end
 
       rescue => e
@@ -170,7 +249,8 @@ class FFmpegAudioStream
         line = @stderr.gets
         break unless line
 
-        # Only log important FFmpeg messages
+        # Always log FFmpeg messages when running on EC2 or when debugging
+        # This helps diagnose connection issues
         if line.include?('error') || line.include?('Error')
           @logger.error "[FFmpeg] #{line.strip}"
 
@@ -183,7 +263,13 @@ class FFmpegAudioStream
           end
         elsif line.include?('warning') || line.include?('Warning')
           @logger.warn "[FFmpeg] #{line.strip}"
-        elsif ENV['DEBUG']
+        elsif line.include?('rtmp') || line.include?('RTMP') || line.include?('flv') || line.include?('FLV')
+          # Always log RTMP/FLV related messages for debugging connection issues
+          @logger.info "[FFmpeg] #{line.strip}"
+        elsif line.include?('Input #') || line.include?('Output #') || line.include?('Stream #')
+          # Log stream information
+          @logger.info "[FFmpeg] #{line.strip}"
+        elsif ENV['DEBUG'] || ENV['VERBOSE_FFMPEG']
           @logger.debug "[FFmpeg] #{line.strip}"
         end
 

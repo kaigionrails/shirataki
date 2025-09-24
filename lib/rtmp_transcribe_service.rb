@@ -55,13 +55,22 @@ class RtmpTranscribeService
       while @audio_stream.buffer.size < 6400 && wait_count < 30  # Wait up to 30 seconds for at least 200ms of audio
         sleep(1)
         wait_count += 1
-        if wait_count % 5 == 0
-          @logger.info "Waiting for audio data... (buffer size: #{@audio_stream.buffer.size})"
+
+        # More detailed logging for debugging
+        if wait_count % 2 == 0 || ENV['DEBUG']
+          @logger.info "Waiting for audio data... (buffer size: #{@audio_stream.buffer.size}, wait: #{wait_count}s)"
+
+          # Check if FFmpeg is still running
+          unless @audio_stream.running?
+            @logger.error "Audio stream stopped while waiting for data!"
+            raise "FFmpeg audio stream stopped unexpectedly"
+          end
         end
       end
 
       if @audio_stream.buffer.size < 6400
         @logger.warn "Starting with insufficient audio buffer (size: #{@audio_stream.buffer.size})"
+        @logger.warn "This might indicate FFmpeg is not receiving RTMP data"
       else
         @logger.info "Audio buffer ready (size: #{@audio_stream.buffer.size})"
       end
@@ -425,11 +434,14 @@ class RtmpTranscribeService
 
   def monitor_services
     @logger.info "Monitoring services..."
+    last_status_time = Time.now
+    status_interval = 10
 
     while @running
       # Check if components are still running
       unless @audio_stream&.running?
         @logger.error "Audio stream stopped unexpectedly"
+        @logger.error "Final buffer size: #{@audio_stream.buffer.size}" if @audio_stream
 
         # Report to Sentry
         Sentry.capture_message(
@@ -442,6 +454,7 @@ class RtmpTranscribeService
 
       unless @transcribe_client&.running?
         @logger.error "Transcribe client stopped unexpectedly"
+        @logger.error "Buffer size when stopped: #{@audio_stream.buffer.size}" if @audio_stream
 
         # Report to Sentry
         Sentry.capture_message(
@@ -452,11 +465,18 @@ class RtmpTranscribeService
         break
       end
 
-      # Print status every 10 seconds
-      if Time.now.to_i % 10 == 0
+      # Print status at regular intervals
+      if Time.now - last_status_time >= status_interval
         buffer_size = @audio_stream.buffer.size
         results_count = @transcribe_client.results.size
-        @logger.info "[Status] Buffer: #{buffer_size} bytes, Results: #{results_count}"
+        @logger.info "[Status] Buffer: #{buffer_size} bytes, Results: #{results_count}, FFmpeg: #{@audio_stream.running? ? 'running' : 'stopped'}"
+
+        # Warn if buffer is consistently empty
+        if buffer_size == 0
+          @logger.warn "Audio buffer is empty - FFmpeg may not be receiving RTMP data"
+        end
+
+        last_status_time = Time.now
       end
 
       sleep(1)

@@ -92,12 +92,20 @@ class RedisStreamsSSEApp
   end
 
   def check_redis_connection
-    Async do
+    # Run in current Async context if available, otherwise create new one
+    if Async::Task.current?
       Async::Redis::Client.open(@redis_endpoint) do |client|
         response = client.call('PING')
         response == 'PONG' ? 'connected' : 'disconnected'
       end
-    end.wait
+    else
+      Async do
+        Async::Redis::Client.open(@redis_endpoint) do |client|
+          response = client.call('PING')
+          response == 'PONG' ? 'connected' : 'disconnected'
+        end
+      end.wait
+    end
   rescue => e
     Sentry.capture_exception(e)
     "error: #{e.message}"
@@ -160,30 +168,16 @@ class RedisStreamSSE
 
     @logger.debug "SSE stream started for client #{@client_id}" if ENV['DEBUG']
 
-    # Start reading from Redis Streams
-    redis_task = read_redis_stream { |event, data|
-      yield "event: #{event}\n"
-      yield "data: #{data}\n\n"
-    }
-
-    # Send heartbeat every 30 seconds
-    heartbeat_task = Async do
-      loop do
-        sleep 30
-        begin
-          yield "event: heartbeat\n"
-          yield "data: #{JSON.generate({ timestamp: Time.now.iso8601 })}\n\n"
-        rescue Errno::EPIPE, IOError => e
-          # Client disconnected - this is normal behavior
-          @logger.debug "Client #{@client_id} disconnected during heartbeat: #{e.class}" if ENV['DEBUG']
-          break
-        end
-      end
+    # Ensure we're running in an Async context
+    if Async::Task.current?
+      # Already in Async context, run directly
+      run_sse_stream { |data| yield data }
+    else
+      # Create new Async context
+      Async do
+        run_sse_stream { |data| yield data }
+      end.wait
     end
-
-    # Wait for tasks
-    redis_task.wait
-    heartbeat_task.stop
 
   rescue Errno::EPIPE, IOError => e
     # Client disconnected - this is normal, don't report to Sentry
@@ -206,9 +200,6 @@ class RedisStreamSSE
       @logger.debug "Could not send error to disconnected client #{@client_id}" if ENV['DEBUG']
     end
   ensure
-    redis_task&.stop
-    heartbeat_task&.stop
-
     # Call cleanup callback
     @on_close&.call
     @logger.info "SSE client disconnected: #{@client_id}"
@@ -216,10 +207,45 @@ class RedisStreamSSE
 
   private
 
+  def run_sse_stream
+    redis_task = nil
+    heartbeat_task = nil
+
+    begin
+      # Start reading from Redis Streams
+      redis_task = Async do
+        read_redis_stream { |event, data|
+          yield "event: #{event}\n"
+          yield "data: #{data}\n\n"
+        }
+      end
+
+      # Send heartbeat every 30 seconds
+      heartbeat_task = Async do
+        loop do
+          sleep 30
+          begin
+            yield "event: heartbeat\n"
+            yield "data: #{JSON.generate({ timestamp: Time.now.iso8601 })}\n\n"
+          rescue Errno::EPIPE, IOError => e
+            # Client disconnected - this is normal behavior
+            @logger.debug "Client #{@client_id} disconnected during heartbeat: #{e.class}" if ENV['DEBUG']
+            break
+          end
+        end
+      end
+
+      # Wait for redis task to complete
+      redis_task.wait
+    ensure
+      redis_task&.stop
+      heartbeat_task&.stop
+    end
+  end
+
   def read_redis_stream
-    Async do
-      begin
-        Async::Redis::Client.open(@redis_endpoint) do |client|
+    begin
+      Async::Redis::Client.open(@redis_endpoint) do |client|
           @logger.info "Connected to Redis, reading new messages from stream: #{@stream_key} (starting from: #{@last_id})"
 
           loop do
@@ -261,7 +287,7 @@ class RedisStreamSSE
                     rescue Errno::EPIPE, IOError => e
                       # Client disconnected while sending message
                       @logger.debug "Client #{@client_id} disconnected while sending message: #{e.class}" if ENV['DEBUG']
-                      return  # Exit the read_redis_stream method
+                      break  # Exit the loop, client disconnected
                     end
                   end
 
@@ -286,23 +312,22 @@ class RedisStreamSSE
             end
           end
         end
-      rescue => e
-        @logger.error "Redis connection error: #{e.message}"
+    rescue => e
+      @logger.error "Redis connection error: #{e.message}"
 
-        # Report to Sentry
-        Sentry.capture_exception(e) do |scope|
-          scope.set_tag('component', 'redis_connection')
-          scope.set_context('redis', {
-            endpoint: @redis_endpoint.to_s
-          })
-        end
-
-        yield 'error', JSON.generate({ error: "Redis connection failed: #{e.message}" })
-
-        # Retry connection after 5 seconds
-        sleep 5
-        retry
+      # Report to Sentry
+      Sentry.capture_exception(e) do |scope|
+        scope.set_tag('component', 'redis_connection')
+        scope.set_context('redis', {
+          endpoint: @redis_endpoint.to_s
+        })
       end
+
+      yield 'error', JSON.generate({ error: "Redis connection failed: #{e.message}" })
+
+      # Retry connection after 5 seconds
+      sleep 5
+      retry
     end
   end
 

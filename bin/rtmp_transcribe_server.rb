@@ -64,14 +64,6 @@ if options[:test_mode]
   puts "TEST MODE: Using generated audio instead of RTMP stream"
 end
 
-# Check AWS credentials (skip in test mode)
-if !options[:test_mode] && (ENV['AWS_ACCESS_KEY_ID'].nil? || ENV['AWS_SECRET_ACCESS_KEY'].nil?)
-  puts "ERROR: AWS credentials not set"
-  puts "Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables"
-  puts "Note: You can use --test flag to run in test mode without AWS"
-  exit 1
-end
-
 # Print configuration
 puts "=" * 60
 puts "RTMP to Amazon Transcribe Service"

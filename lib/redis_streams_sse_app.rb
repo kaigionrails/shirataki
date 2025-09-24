@@ -155,7 +155,7 @@ class RedisStreamSSE
   end
 
   def each
-    # Send initial connection message
+    # Send initial connection message before entering Async context
     yield "event: connected\n"
     yield "data: #{JSON.generate({
       message: 'Connected to Redis Streams SSE',
@@ -168,68 +168,88 @@ class RedisStreamSSE
 
     @logger.debug "SSE stream started for client #{@client_id}" if ENV['DEBUG']
 
-    # Ensure we're running in an Async context
-    if Async::Task.current?
-      # Already in Async context, run directly
-      run_sse_stream { |data| yield data }
-    else
-      # Create new Async context
-      Async do
-        run_sse_stream { |data| yield data }
-      end.wait
+    # Create a queue for async tasks to send data through
+    queue = Queue.new
+
+    # Start async tasks in background
+    async_task = Async do |task|
+      begin
+        run_sse_stream_async(task, queue)
+      rescue => e
+        queue.push([:error, e])
+      end
     end
 
-  rescue Errno::EPIPE, IOError => e
-    # Client disconnected - this is normal, don't report to Sentry
-    @logger.info "SSE client #{@client_id} disconnected: #{e.class.name}"
-  rescue => e
-    # Report other errors to Sentry with SSE context
-    Sentry.capture_exception(e) do |scope|
-      scope.set_context('sse', {
-        room: @room,
-        language: @language,
-        last_id: @last_id
-      })
-    end
-
+    # Read from queue and yield to the client (synchronously)
     begin
-      yield "event: error\n"
-      yield "data: #{JSON.generate({ error: e.message })}\n\n"
-    rescue Errno::EPIPE, IOError
-      # Client already disconnected, can't send error message
-      @logger.debug "Could not send error to disconnected client #{@client_id}" if ENV['DEBUG']
+      while true
+        type, data = queue.pop
+
+        case type
+        when :data
+          yield data
+        when :error
+          raise data
+        when :done
+          break
+        end
+      end
+    rescue Errno::EPIPE, IOError => e
+      # Client disconnected - this is normal, don't report to Sentry
+      @logger.info "SSE client #{@client_id} disconnected: #{e.class.name}"
+    rescue => e
+      # Report other errors to Sentry with SSE context
+      Sentry.capture_exception(e) do |scope|
+        scope.set_context('sse', {
+          room: @room,
+          language: @language,
+          last_id: @last_id
+        })
+      end
+
+      begin
+        yield "event: error\n"
+        yield "data: #{JSON.generate({ error: e.message })}\n\n"
+      rescue Errno::EPIPE, IOError
+        # Client already disconnected, can't send error message
+        @logger.debug "Could not send error to disconnected client #{@client_id}" if ENV['DEBUG']
+      end
+    ensure
+      # Stop async task if still running
+      async_task&.stop
+
+      # Call cleanup callback
+      @on_close&.call
+      @logger.info "SSE client disconnected: #{@client_id}"
     end
-  ensure
-    # Call cleanup callback
-    @on_close&.call
-    @logger.info "SSE client disconnected: #{@client_id}"
   end
 
   private
 
-  def run_sse_stream
+  def run_sse_stream_async(parent_task, queue)
     redis_task = nil
     heartbeat_task = nil
 
     begin
-      # Start reading from Redis Streams
-      redis_task = Async do
+      # Start reading from Redis Streams within parent task context
+      redis_task = parent_task.async do
         read_redis_stream { |event, data|
-          yield "event: #{event}\n"
-          yield "data: #{data}\n\n"
+          # Send data through queue instead of yielding directly
+          queue.push([:data, "event: #{event}\n"])
+          queue.push([:data, "data: #{data}\n\n"])
         }
       end
 
-      # Send heartbeat every 30 seconds
-      heartbeat_task = Async do
+      # Send heartbeat every 30 seconds within parent task context
+      heartbeat_task = parent_task.async do
         loop do
           sleep 30
           begin
-            yield "event: heartbeat\n"
-            yield "data: #{JSON.generate({ timestamp: Time.now.iso8601 })}\n\n"
-          rescue Errno::EPIPE, IOError => e
-            # Client disconnected - this is normal behavior
-            @logger.debug "Client #{@client_id} disconnected during heartbeat: #{e.class}" if ENV['DEBUG']
+            queue.push([:data, "event: heartbeat\n"])
+            queue.push([:data, "data: #{JSON.generate({ timestamp: Time.now.iso8601 })}\n\n"])
+          rescue => e
+            # Client disconnected or queue closed
+            @logger.debug "Heartbeat stopped: #{e.class}" if ENV['DEBUG']
             break
           end
         end
@@ -237,6 +257,7 @@ class RedisStreamSSE
 
       # Wait for redis task to complete
       redis_task.wait
+      queue.push([:done, nil])
     ensure
       redis_task&.stop
       heartbeat_task&.stop

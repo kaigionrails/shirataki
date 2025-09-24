@@ -9,11 +9,9 @@ require 'sentry-ruby'
 
 class RedisStreamsSSEApp
   def initialize(logger: nil)
-    @redis_endpoint = Async::Redis.local_endpoint(
-      host: ENV.fetch('REDIS_HOST', 'localhost'),
-      port: ENV.fetch('REDIS_PORT', 6379).to_i,
-      db: ENV.fetch('REDIS_DB', 0).to_i
-    )
+    # Parse Redis URL (supports redis:// and rediss:// for TLS)
+    redis_url = ENV.fetch('REDIS_URL', 'redis://localhost:6379/0')
+    @redis_endpoint = Async::Redis::Endpoint.parse(redis_url)
     @stream_key = ENV.fetch('REDIS_STREAM_KEY', 'transcription_stream')
     @connected_clients = Concurrent::Hash.new
     @logger = logger || Logger.new(STDOUT).tap do |log|

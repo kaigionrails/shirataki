@@ -1,9 +1,9 @@
-FROM ruby:3.3.7-bookworm
+FROM ruby:3.4.6-slim-trixie
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
-    openssl \
+    libssl-dev \
     ffmpeg
 
 WORKDIR /app

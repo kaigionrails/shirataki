@@ -1,4 +1,4 @@
-FROM ruby:3.4.6-slim-trixie
+FROM ruby:3.4.7-slim-trixie
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \

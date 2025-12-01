@@ -89,6 +89,7 @@ class FFmpegAudioStream
     end
 
     @logger.info "FFmpeg process monitor stopped"
+    start_ffmpeg
   rescue => e
     @logger.error "FFmpeg monitor thread error: #{e.message}"
   end

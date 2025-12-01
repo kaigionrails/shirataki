@@ -293,3 +293,12 @@ class FFmpegAudioStream
     @logger.info "Error stream thread stopped"
   end
 end
+
+if __FILE__ == $0
+  audio_stream = FFmpegAudioStream.new
+  audio_stream.start
+
+  while audio_stream.running?
+    sleep 2
+  end
+end
